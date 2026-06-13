@@ -367,7 +367,12 @@ async fn connect_grpc_stream(
     let mut client = build_grpc_client(endpoint, args).await?;
     let mut pending_update = None;
     let build_request = |from_slot| {
-        build_subscribe_request(commitment, from_slot, include_entries, include_slot_notifications)
+        build_subscribe_request(
+            commitment,
+            from_slot,
+            include_entries,
+            include_slot_notifications,
+        )
     };
     let stream = match subscribe_from_slot_mode {
         Some(FromSlotMode::Zero) | Some(FromSlotMode::LatestDb) => {

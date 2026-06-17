@@ -1003,7 +1003,9 @@ impl DiskCacheInner {
     pub(crate) fn corrupt_block_meta_for_tests(&self, slot: u64) {
         self.db
             .put_cf(
-                &self.cf(schema::CF_BLOCK_META).expect("block meta CF exists"),
+                &self
+                    .cf(schema::CF_BLOCK_META)
+                    .expect("block meta CF exists"),
                 schema::slot_key(slot),
                 [codec::VALUE_VERSION_V1, 0xFF, 0xFF],
             )
@@ -1365,7 +1367,10 @@ pub(crate) mod tests {
                 .inner_for_tests()
                 .db
                 .put_cf(
-                    &cache.inner_for_tests().cf(schema::CF_META).expect("meta CF exists"),
+                    &cache
+                        .inner_for_tests()
+                        .cf(schema::CF_META)
+                        .expect("meta CF exists"),
                     schema::META_SCHEMA_VERSION,
                     9999u32.to_be_bytes(),
                 )

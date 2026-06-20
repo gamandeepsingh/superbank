@@ -854,6 +854,13 @@ impl DiskCacheInner {
             return DiskBlockResult::Found(Box::new(StoredBlockPayload::Metadata(metadata)));
         }
 
+        if let Err(err) = self.cf(schema::CF_TX) {
+            warn!(
+                slot,
+                "disk cache: {err}; returning NotCovered without poisoning"
+            );
+            return DiskBlockResult::NotCovered;
+        }
         let transactions = match self.read_slot_transactions(slot, tx_count) {
             Some(transactions) => transactions,
             None => {

@@ -286,6 +286,12 @@ pub(crate) async fn execute_shard_tcp_query_block(
     }
 }
 
+/// Source of the timeout returned when a bounded local-cache admission wait expires, so
+/// callers can tell a busy cache from a slow query.
+#[derive(Debug, thiserror::Error)]
+#[error("local cache admission busy")]
+pub(crate) struct CacheAdmissionBusy;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BucketModuli {
     pub(crate) gsfa: u64,
@@ -315,6 +321,14 @@ pub struct ClickHouseClient {
     pub(crate) password: String,
     pub(crate) signature_slot_cache: Arc<SignatureSlotCache>,
     pub(crate) cache_partition: Option<(u64, u64)>,
+    /// Local-cache reads only: inclusive slot bounds for a multi-partition read. When set,
+    /// `cache_slot_predicate` filters on this range instead of one partition;
+    /// `cache_partition` still marks the client as a local-cache client.
+    pub(crate) cache_slot_range: Option<(u64, u64)>,
+    /// Local-cache reads only: the longest wait for HTTP admission before failing with
+    /// [`CacheAdmissionBusy`], so a saturated cache denies quickly instead of spending
+    /// the caller's budget in the queue.
+    pub(crate) cache_admission_wait: Option<Duration>,
     pub(crate) transaction_table: String,
     pub(crate) blocks_metadata_table: String,
     pub(crate) gsfa_table: String,
@@ -725,6 +739,8 @@ impl ClickHouseClient {
             password: password.to_string(),
             signature_slot_cache: Arc::new(SignatureSlotCache::from_env()),
             cache_partition: None,
+            cache_slot_range: None,
+            cache_admission_wait: None,
             transaction_table,
             blocks_metadata_table,
             gsfa_table,
@@ -1029,10 +1045,15 @@ impl ClickHouseClient {
     }
 
     pub(crate) fn cache_slot_predicate(&self) -> String {
-        self.cache_partition
-            .map_or_else(String::new, |(width, partition)| {
-                format!(" AND intDiv(slot, {width}) = {partition}")
-            })
+        let Some((width, partition)) = self.cache_partition else {
+            return String::new();
+        };
+        // A plain slot range keeps primary-key analysis on binary search; an
+        // `intDiv(slot, w) IN (...)` set forces a scan of every candidate part's index.
+        match self.cache_slot_range {
+            Some((low, high)) => format!(" AND slot BETWEEN {low} AND {high}"),
+            None => format!(" AND intDiv(slot, {width}) = {partition}"),
+        }
     }
 
     pub(crate) fn select_settings_clause(
@@ -1174,7 +1195,7 @@ impl ClickHouseClient {
         match tokio::time::timeout(timeout, super::read_query::admission::scope(fut)).await {
             Ok(result) => result,
             Err(_) => {
-                crate::metrics::clickhouse_timeout(operation);
+                crate::metrics::clickhouse_timeout_for(operation, self.read_endpoint.target());
                 Err(ProcessingError::timeout_msg(format!(
                     "ClickHouse operation '{operation}' timed out after {timeout:?}"
                 )))
@@ -1183,15 +1204,35 @@ impl ClickHouseClient {
     }
 
     /// Acquires one global HTTP-query permit. Callers must acquire it inside an operation timeout
-    /// so admission and execution share the same bounded budget.
+    /// so admission and execution share the same bounded budget. A local-cache client with
+    /// `cache_admission_wait` fails with a [`CacheAdmissionBusy`]-sourced timeout instead of
+    /// waiting longer.
     pub(crate) async fn acquire_http_query_permit(
         &self,
     ) -> ProcessingResult<super::read_query::admission::AdmissionLease> {
         #[cfg(feature = "disk-cache")]
         let started = std::time::Instant::now();
-        let permit = super::read_query::admission::acquire(&self.http_query_sem)
-            .await
-            .map_err(|_| ProcessingError::database_msg("ClickHouse HTTP query semaphore closed"));
+        let acquire = super::read_query::admission::acquire(&self.http_query_sem);
+        let permit = match self.cache_admission_wait {
+            // `timeout` polls the acquire before the timer, so a zero wait is a try-acquire.
+            Some(wait) => match tokio::time::timeout(wait, acquire).await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    #[cfg(feature = "disk-cache")]
+                    crate::metrics::disk_cache_key_seconds(
+                        "admission",
+                        "busy",
+                        started.elapsed().as_secs_f64(),
+                    );
+                    return Err(ProcessingError::Timeout {
+                        context: format!("local cache admission busy after {wait:?}"),
+                        source: Some(Box::new(CacheAdmissionBusy)),
+                    });
+                }
+            },
+            None => acquire.await,
+        }
+        .map_err(|_| ProcessingError::database_msg("ClickHouse HTTP query semaphore closed"));
         #[cfg(feature = "disk-cache")]
         self.record_cache_admission(started);
         permit
@@ -2650,6 +2691,44 @@ mod tests {
             .expect("cache admission");
         assert!(source.is_none());
         drop(held);
+    }
+
+    #[test]
+    fn cache_slot_predicate_uses_range_when_set() {
+        let mut client = test_client_with_hot_addresses(Vec::new());
+        assert_eq!(client.cache_slot_predicate(), "");
+        client.cache_partition = Some((10, 7));
+        assert_eq!(client.cache_slot_predicate(), " AND intDiv(slot, 10) = 7");
+        client.cache_slot_range = Some((20, 79));
+        assert_eq!(client.cache_slot_predicate(), " AND slot BETWEEN 20 AND 79");
+    }
+
+    #[tokio::test]
+    async fn bounded_cache_admission_denies_quickly_when_saturated() {
+        let mut client = test_client_with_http_limit(Duration::from_secs(5));
+        client.cache_partition = Some((10, 1));
+        client.cache_admission_wait = Some(Duration::from_millis(5));
+        let held = client
+            .acquire_http_query_permit()
+            .await
+            .expect("free permit");
+        let started = std::time::Instant::now();
+        let err = match client.acquire_http_query_permit().await {
+            Ok(_) => panic!("saturated admission must not succeed"),
+            Err(err) => err,
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            &err,
+            ProcessingError::Timeout { source: Some(source), .. } if source.is::<super::CacheAdmissionBusy>()
+        ));
+        drop(held);
+        // A zero wait still takes a free permit: the acquire is polled before the timer.
+        client.cache_admission_wait = Some(Duration::ZERO);
+        client
+            .acquire_http_query_permit()
+            .await
+            .expect("free permit with zero wait");
     }
 
     #[cfg(feature = "disk-cache")]
